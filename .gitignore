@@ -1,0 +1,19 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+
+# OS metadata
+.DS_Store
+
+# IDE
+.idea/
+
+# Datasets (large data + nested git repos)
+cnn_trainer/datasets/
+
+# Trained model weights (cnn_trainer only — noise/models/ is tracked)
+cnn_trainer/audio/models/
