@@ -1,4 +1,5 @@
 import csv
+import os
 import numpy as np
 import torch
 import torch.nn as nn
@@ -99,8 +100,12 @@ class EmotionClassifier:
 
 
 if __name__ == "__main__":
-    clf = SoundClassifier("yamnet.tflite", "yamnet_class_map.csv")
-    ser = EmotionClassifier("../models/emotion_fusion_resnet18_merged.pt")
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    clf = SoundClassifier(
+        os.path.join(_HERE, "../models/yamnet.tflite"),
+        os.path.join(_HERE, "../models/yamnet_class_map.csv"),
+    )
+    ser = EmotionClassifier(os.path.join(_HERE, "../models/emotion_fusion_resnet18_merged.pt"))
 
     noise = (np.random.randn(48000) * 0.05).astype(np.float32)
     print("speech score:", clf.speech_score(noise))

@@ -39,8 +39,8 @@ def main():
     )
 
     clf = SoundClassifier(
-        os.path.join(HERE, "yamnet.tflite"),
-        os.path.join(HERE, "yamnet_class_map.csv"),
+        os.path.join(HERE, "../models/yamnet.tflite"),
+        os.path.join(HERE, "../models/yamnet_class_map.csv"),
         top_k=3,
     )
     ser = EmotionClassifier(os.path.join(HERE, "../models/emotion_fusion_resnet18_merged.pt"))

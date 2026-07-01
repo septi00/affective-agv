@@ -10,9 +10,11 @@ from tqdm import tqdm
 from features_fusion import wav_to_fusion_tensor   # same extractor as training
 
 # --- point these at your two dataset roots --------------------------------
-BESD_DIR   = "/Users/septi/dis_ws/cnn_trainer/besd"     # children
-CREMAD_DIR = "/Users/septi/dis_ws/cnn_trainer/crema-d-mirror/AudioWAV"   # adults  <-- SET THIS
-WEIGHTS    = "emotion_fusion_resnet18_merged.pt"
+_HERE      = os.path.dirname(os.path.abspath(__file__))
+_DATASETS  = os.path.join(_HERE, "..", "..", "datasets")
+BESD_DIR   = os.path.join(_DATASETS, "besd")
+CREMAD_DIR = os.path.join(_DATASETS, "crema-d", "AudioWAV")
+WEIGHTS    = os.path.join(_HERE, "..", "models", "emotion_fusion_resnet18_merged.pt")
 # --------------------------------------------------------------------------
 
 EMOTIONS    = {"angry": 0, "disgust": 1, "fear": 2, "happy": 3, "neutral": 4, "sad": 5}
@@ -36,7 +38,7 @@ def parse_besd(path):
     gender = rest[1].upper()
     m = re.search(r"\d+", rest[2:])
     age = m.group() if m else "0"
-    return emotion, f"{gender}_{age}_{serial}", "child"
+    return emotion, f"child_{gender}_{age}_{serial}", "child"
 
 
 def parse_cremad(path):
@@ -47,7 +49,7 @@ def parse_cremad(path):
     emotion = CREMAD_CODE.get(parts[2].upper())
     if emotion is None:
         return None
-    return emotion, f"CREMA_{parts[0]}", "adult"
+    return emotion, f"adult_actor_{parts[0]}", "adult"
 
 
 def load_all():
