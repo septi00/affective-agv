@@ -23,6 +23,7 @@ SKELETON = [
 
 CONF_THRESH = 0.3
 NN_W, NN_H  = 512, 288
+OPEN_THRESH = 1.0   # openness > this -> OPEN (tune to your numbers)
 
 # BGR colors: left side = greens/cyans, right side = reds/oranges, face = yellows
 KEYPOINT_COLORS = [
@@ -86,6 +87,7 @@ def main():
                 print("Running — press q to quit")
 
                 last_txt = None
+                last_col = (0, 255, 0)
 
                 while True:
                     frame_data = q_frame.tryGet()
@@ -145,12 +147,17 @@ def main():
                                     cv2.putText(frame, f"{z_m:.2f}m", (px + 5, py),
                                                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
 
-                            op, act = pf.update(pts)
+                            op, mean, burst = pf.update(pts)
                             if op is not None:
-                                last_txt = f"open {op:.2f}" + (f"  act {act:.2f}" if act is not None else "")
+                                state = "OPEN" if op > OPEN_THRESH else "CLOSED"
+                                last_txt = f"open {op:.2f}  [{state}]"
+                                if mean is not None:
+                                    last_txt += f"   act {mean:.2f}  burst {burst:.2f}"
+                                last_col = (0, 255, 0) if op > OPEN_THRESH else (0, 160, 255)
 
                     if last_txt is not None:
-                        cv2.putText(frame, last_txt, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2)
+                        cv2.putText(frame, last_txt, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
+                                    last_col, 2)
 
                     cv2.imshow("Pose", frame)
                     if cv2.waitKey(1) == ord("q"):

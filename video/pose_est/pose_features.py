@@ -21,7 +21,11 @@ L_SH, R_SH = 5, 6
 L_WR, R_WR = 9, 10
 L_HIP, R_HIP = 11, 12
 L_AN, R_AN = 15, 16
+L_EL, R_EL = 7, 8
 EXTREMITIES = [L_WR, R_WR]
+# upper-body joints whose 3D convex-hull VOLUME = how much space the body occupies
+VOLUME_JOINTS = [NOSE, L_SH, R_SH, L_EL, R_EL, L_WR, R_WR]
+JITTER_FLOOR = 0.05   # per-joint normalised movement below this = keypoint noise, ignored
 
 
 def _xyz(pts, i):
@@ -69,48 +73,42 @@ def body_center(pts):
 
 
 def openness(pts, intrinsics=None):
-    """Mean 3D perpendicular distance of wrists from the torso midline,
-    normalised by shoulder width. Hands by sides/pockets -> low; arms spread
-    or extended toward camera -> high.
+    """Openness = mean 3D distance of BOTH wrists from the body centre (shoulder
+    midpoint), in shoulder-width units. Full 3D -> reaching to the SIDE, UP, or
+    toward the CAMERA all count. Only hands near the body read closed.
 
-    Midline = nose to shoulder midpoint. Missing depth is filled by reprojecting
-    at the median Z of all detected keypoints, so the reading is continuous."""
+    Robust to depth holes: if a wrist/shoulder has no valid stereo depth, its 3D
+    position is reprojected at the median body depth, so openness ALWAYS computes
+    when the joints are detected (it never freezes on missing wrist depth).
+    """
     zs = [p[5] for p in pts.values() if p[5] is not None]
     fallback_z = float(np.median(zs)) if zs else None
 
-    nose = _est_xyz(pts, NOSE,  fallback_z, intrinsics)
-    ls   = _est_xyz(pts, L_SH,  fallback_z, intrinsics)
-    rs   = _est_xyz(pts, R_SH,  fallback_z, intrinsics)
-    if nose is None or ls is None or rs is None:
+    ls = _est_xyz(pts, L_SH, fallback_z, intrinsics)
+    rs = _est_xyz(pts, R_SH, fallback_z, intrinsics)
+    if ls is None or rs is None:
         return None
-
     sh_mid   = (ls + rs) / 2.0
-    axis     = sh_mid - nose
-    axis_len = np.linalg.norm(axis)
     sh_width = np.linalg.norm(ls - rs)
-    if axis_len < 0.01 or sh_width < 0.02:
+    if sh_width < 0.02:
         return None
-    axis_hat = axis / axis_len
 
-    ds = []
-    for i in EXTREMITIES:
-        w = _est_xyz(pts, i, fallback_z, intrinsics)
-        if w is None:
-            continue
-        v = w - nose
-        perp = v - np.dot(v, axis_hat) * axis_hat
-        ds.append(np.linalg.norm(perp))
-
-    if not ds:
+    reaches = []
+    for i in (L_WR, R_WR):
+        w = _est_xyz(pts, i, fallback_z, intrinsics)      # falls back to body depth if no stereo
+        if w is not None:
+            reaches.append(np.linalg.norm(w - sh_mid))
+    if len(reaches) < 2:                                   # need both wrists detected
         return None
-    return float(np.mean(ds) / sh_width)
 
+    return float(np.mean(reaches) / sh_width)
 
 class PoseFeatures:
     """Tracks openness and activity over a sliding window."""
-    def __init__(self, window=30, intrinsics=None):
+    def __init__(self, window=15, intrinsics=None, open_window=7):
         self.prev = None
         self.speeds = deque(maxlen=window)
+        self.open_hist = deque(maxlen=open_window)   # smooth noisy openness
         self.intrinsics = intrinsics
 
     def update(self, pts):
@@ -123,13 +121,29 @@ class PoseFeatures:
         sh_scale = (np.linalg.norm(cur[L_SH] - cur[R_SH])
                     if L_SH in cur and R_SH in cur else None)
 
-        if self.prev is not None and sh_scale and sh_scale > 0.02:
-            shared = [i for i in cur if i in self.prev]
-            if shared:
-                moved = np.mean([np.linalg.norm(cur[i] - self.prev[i]) for i in shared])
-                self.speeds.append(float(moved / sh_scale))
+        # torso (shoulder-centre) motion this frame -- subtract it so walking/
+        # translating the whole body doesn't count as arm activity. Only motion
+        # of the wrists RELATIVE to the torso is "activity".
+        torso_now  = ((cur[L_SH] + cur[R_SH]) / 2.0) if (L_SH in cur and R_SH in cur) else None
+        torso_prev = ((self.prev[L_SH] + self.prev[R_SH]) / 2.0) \
+                     if (self.prev is not None and L_SH in self.prev and R_SH in self.prev) else None
+
+        if self.prev is not None and sh_scale and sh_scale > 0.02 and torso_now is not None and torso_prev is not None:
+            torso_disp = torso_now - torso_prev
+            wrists = [i for i in (L_WR, R_WR) if i in cur and i in self.prev]
+            if wrists:
+                # each wrist's movement MINUS the torso's movement = motion relative to body
+                per_joint = [np.linalg.norm((cur[i] - self.prev[i]) - torso_disp) / sh_scale
+                             for i in wrists]
+                per_joint = [m if m > JITTER_FLOOR else 0.0 for m in per_joint]
+                self.speeds.append(float(np.mean(per_joint)))
         self.prev = cur
 
-        op       = openness(pts, self.intrinsics)
-        activity = float(np.mean(self.speeds)) if self.speeds else None
-        return op, activity
+        raw_op = openness(pts, self.intrinsics)
+        if raw_op is not None:
+            self.open_hist.append(raw_op)
+        op = float(np.median(self.open_hist)) if self.open_hist else None  # median = robust to depth spikes
+
+        mean  = float(np.mean(self.speeds)) if self.speeds else None   # sustained energy
+        burst = float(np.max(self.speeds))  if self.speeds else None   # sharpest recent movement
+        return op, mean, burst

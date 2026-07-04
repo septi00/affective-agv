@@ -19,105 +19,68 @@ DECISION RULE -- two modes (set DECISION below):
        lands on Surprise/Contempt, count it WRONG rather than redistributing.
        This is the "8-class fix" -- it stops putting words in the model's mouth.
 
-Run "pick_then_map" and "drop_then_pick" and compare anger recall: if anger
-jumps under pick_then_map, the weakness was the decision rule, not the model.
+Detection + crop + HSEmotion now come from the shared core (face_detector,
+face_features, face_classifier) via face_clip.sum_face_logits, so this harness
+and fuse_crema_d.py feed the model identically. The DECISION rule stays here --
+it's a consumer choice, not part of the core.
 
 Run:
     pip install hsemotion-onnx opencv-python numpy scikit-learn matplotlib
     python score_crema_d.py
 Set CREMA_DIR and SUMMARY_CSV below to your local paths first.
 """
-
-import urllib.request          # <-- fixes hsemotion-onnx 0.3.1 download bug; keep this import
 import os, csv, sys
 import numpy as np
-import cv2
-from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
 from sklearn.metrics import classification_report, confusion_matrix, accuracy_score, f1_score
 
+from face_classifier import FaceClassifier, HSE, HSE_TO_6, HSE_KEEP, SIX
+from face_clip import sum_face_logits
+
 # ---------------------------------------------------------------- CONFIG
-CREMA_DIR   = os.path.expanduser("/cnn_trainer/datasets/crema-d/VideoFlash")              # folder of .flv clips
-SUMMARY_CSV = os.path.expanduser("/cnn_trainer/datasets/crema-d/processedResults/summaryTable.csv")
+CREMA_DIR   = "/Users/septi/dis_ws/cnn_trainer/datasets/crema-d/VideoFlash"
+SUMMARY_CSV = "/Users/septi/dis_ws/cnn_trainer/datasets/crema-d/processedResults/summaryTable.csv"
 MODEL_NAME  = "enet_b0_8_best_vgaf"   # b0 beat b2 on your data; keep b0
 FRAMES_PER_CLIP = 3                   # frames sampled from the expressive middle of each clip
 SKIP_TIES   = True                    # skip ambiguous FaceVotes like "A:F" (cleaner number)
 LIMIT       = None                    # set e.g. 50 for a quick smoke run; None = full dataset
 DECISION    = "pick_then_map"         # "pick_then_map" (8-class fix) or "drop_then_pick" (old)
-OUT_DIR     = os.path.expanduser("/video/face_rec/results")
+OUT_DIR     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "results")
 # -----------------------------------------------------------------------
 
-# HSEmotion 8 classes -> your 6 (Contempt and Surprise have no CREMA-D equivalent)
-HSE      = ['Anger','Contempt','Disgust','Fear','Happiness','Neutral','Sadness','Surprise']
-HSE_TO_6 = {'Anger':'anger','Disgust':'disgust','Fear':'fear','Happiness':'happy','Neutral':'neutral','Sadness':'sad'}
-KEEP_IDX = [i for i, n in enumerate(HSE) if n in HSE_TO_6]   # [0,2,3,4,5,6]
-KEEP_CLS = [HSE_TO_6[HSE[i]] for i in KEEP_IDX]
-SIX      = ['anger','disgust','fear','happy','neutral','sad']
 OUT_OF_SET = "__out__"               # marker: model picked Surprise/Contempt (a real miss)
 
 FACEVOTE = {'A':'anger','D':'disgust','F':'fear','H':'happy','N':'neutral','S':'sad'}
 FILENAME = {'ANG':'anger','DIS':'disgust','FEA':'fear','HAP':'happy','NEU':'neutral','SAD':'sad'}
 
-fer = None
-cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
-
 
 def decide(summed_logits):
     """Turn averaged 8-logits into a predicted label, per DECISION mode."""
     if DECISION == "drop_then_pick":
-        sub = summed_logits[KEEP_IDX]
-        return KEEP_CLS[int(np.argmax(sub))]
+        sub = summed_logits[HSE_KEEP]
+        return SIX[int(np.argmax(sub))]
     elif DECISION == "pick_then_map":
         top = int(np.argmax(summed_logits))          # honest top-1 over all 8
-        name = HSE[top]
-        return HSE_TO_6.get(name, OUT_OF_SET)        # Surprise/Contempt -> OUT_OF_SET (counted wrong)
+        return HSE_TO_6.get(HSE[top], OUT_OF_SET)    # Surprise/Contempt -> OUT_OF_SET (counted wrong)
     else:
         raise ValueError(f"unknown DECISION: {DECISION}")
 
 
-def detect_largest_face(frame_bgr):
-    gray = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(48, 48))
-    if len(faces) == 0:
-        return None
-    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-    return (x, y, x + w, y + h)
-
-
-def predict_clip(path):
-    """Decode, sample middle frames, detect+crop+HSEmotion, average logits, decide.
+def predict_clip(path, clf):
+    """Sample frames, run the shared face core, average logits, decide.
     Returns predicted label (one of SIX or OUT_OF_SET) or None if no face found."""
-    from face_features import crop_face_rgb
-    cap = cv2.VideoCapture(path)
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
-        cap.release(); return None
-    positions = np.linspace(0.35, 0.65, FRAMES_PER_CLIP) * total
-    summed, n = np.zeros(8), 0
-    for pos in positions:
-        cap.set(cv2.CAP_PROP_POS_FRAMES, int(pos))
-        ok, frame = cap.read()
-        if not ok:
-            continue
-        box = detect_largest_face(frame)
-        if box is None:
-            continue
-        crop = crop_face_rgb(frame, box)
-        _, logits = fer.predict_emotions(crop, logits=True)
-        summed += np.array(logits); n += 1
-    cap.release()
+    summed, n = sum_face_logits(path, clf, FRAMES_PER_CLIP)
     if n == 0:
         return None
     return decide(summed)
 
 
 def main():
-    global fer
     os.makedirs(OUT_DIR, exist_ok=True)
     if not os.path.isdir(CREMA_DIR) or not os.path.isfile(SUMMARY_CSV):
         sys.exit(f"Set CREMA_DIR / SUMMARY_CSV. Got:\n  {CREMA_DIR}\n  {SUMMARY_CSV}")
 
     print(f"Loading {MODEL_NAME} | decision rule: {DECISION}")
-    fer = HSEmotionRecognizer(model_name=MODEL_NAME)
+    clf = FaceClassifier(model_name=MODEL_NAME)
 
     rows = list(csv.DictReader(open(SUMMARY_CSV)))
     if LIMIT:
@@ -136,7 +99,7 @@ def main():
         path = os.path.join(CREMA_DIR, name + '.flv')
         if not os.path.isfile(path):
             missing += 1; continue
-        pred = predict_clip(path)
+        pred = predict_clip(path, clf)
         if pred is None:
             skipped_noface += 1; continue
         if pred == OUT_OF_SET:
