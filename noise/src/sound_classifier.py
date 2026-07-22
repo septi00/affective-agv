@@ -23,6 +23,9 @@ class SoundClassifier:
 
     def __init__(self, model_path, labels_path, top_k=3):
         self.interpreter = Interpreter(model_path=model_path)
+        self.interpreter.resize_tensor_input(
+            self.interpreter.get_input_details()[0]["index"], [YAMNET_FRAME]
+        )
         self.interpreter.allocate_tensors()
         self.inp = self.interpreter.get_input_details()[0]
         self.out = self.interpreter.get_output_details()[0]
@@ -46,7 +49,7 @@ class SoundClassifier:
             x = np.pad(x, (0, YAMNET_FRAME - len(x)))
         elif len(x) > YAMNET_FRAME:
             x = x[-YAMNET_FRAME:]
-        self.interpreter.set_tensor(self.inp["index"], x.reshape(self.inp["shape"]))
+        self.interpreter.set_tensor(self.inp["index"], x)
         self.interpreter.invoke()
         return self.interpreter.get_tensor(self.out["index"])[0]   # shape (521,)
 
@@ -97,6 +100,13 @@ class EmotionClassifier:
         probs = torch.softmax(self.model(x), dim=1)[0].cpu().numpy()
         i = int(probs.argmax())
         return CLASS_NAMES[i], float(probs[i])
+
+    @torch.no_grad()
+    def classify_probs(self, mono):
+        """Like classify() but returns the full 6-class probability vector (numpy float32).
+        Order matches CLASS_NAMES: anger, disgust, fear, happy, neutral, sad."""
+        x = array_to_fusion_tensor(mono).unsqueeze(0).to(self.device)
+        return torch.softmax(self.model(x), dim=1)[0].cpu().numpy()
 
 
 if __name__ == "__main__":
