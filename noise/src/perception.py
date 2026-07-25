@@ -32,7 +32,7 @@ import pyroomacoustics as pra
 
 from config import (
     AZ_GRID, CLASSIFY_EVERY, FS, MIC_POS, NFFT, RMS_GATE,
-    SER_FRAME, SPEECH_THRESH, TRACK_STD_MAX_DEG,
+    SER_FRAME, SPEECH_HOLD_WINDOWS, SPEECH_THRESH, TRACK_STD_MAX_DEG,
 )
 from multi_tracker import MultiTracker
 from peak_picking import pick_peaks
@@ -85,6 +85,7 @@ class Perception:
 
         self._buf = deque(maxlen=SER_FRAME)   # rolling ch0 mono, ~3 s
         self._since_classify = 0
+        self._speech_hold = 0   # classify windows remaining before DOA stops tracking
 
     def feed(self, mics, proc) -> PerceptionResult:
         """Process one block. mics:(4,N) raw mics, proc:(N,) processed ch0."""
@@ -97,6 +98,10 @@ class Perception:
             self._since_classify = 0
             window = np.array(self._buf, dtype=np.float32)
             result.sound = self._classify(window)
+            if result.sound.is_speech:
+                self._speech_hold = SPEECH_HOLD_WINDOWS
+            elif self._speech_hold > 0:
+                self._speech_hold -= 1
 
         # --- DOA path (raw mics) --------------------------------------------
         result.tracks = self._update_doa(mics)
@@ -113,8 +118,8 @@ class Perception:
 
     def _update_doa(self, mics) -> list:
         rms = float(np.sqrt(np.mean(mics ** 2)))
-        if rms < RMS_GATE:
-            self.tracker.step([])          # let tracks coast/age during silence
+        if rms < RMS_GATE or self._speech_hold == 0:
+            self.tracker.step([])
             return []
 
         X = pra.transform.stft.analysis(mics.T, NFFT, NFFT // 2)

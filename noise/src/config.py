@@ -47,3 +47,6 @@ TRACK_STD_MAX_DEG = 30.0
 CLASSIFY_EVERY = 4
 SER_FRAME      = FS * 3    # 3 s buffer for SER (matches training)
 SPEECH_THRESH  = 0.30      # tune on your own recordings
+# DOA keeps tracking for this many classify windows after the last speech hit.
+# 3 windows × ~1 s/window = ~3 s of tolerance for natural pauses.
+SPEECH_HOLD_WINDOWS = 3

@@ -3,6 +3,7 @@ import numpy as np
 import depthai as dai
 from depthai_nodes.node import ParsingNeuralNetwork
 from pose_features import PoseFeatures
+from pose_emotion import OPEN_THRESH
 
 ARCHIVE_PATH = "models/yolov8n-pose.rvc2.tar.xz"
 
@@ -23,7 +24,6 @@ SKELETON = [
 
 CONF_THRESH = 0.3
 NN_W, NN_H  = 512, 288
-OPEN_THRESH = 1.0   # openness > this -> OPEN (tune to your numbers)
 
 # BGR colors: left side = greens/cyans, right side = reds/oranges, face = yellows
 KEYPOINT_COLORS = [

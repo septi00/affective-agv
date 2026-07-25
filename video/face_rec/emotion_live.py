@@ -15,6 +15,9 @@ import cv2
 import numpy as np
 from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
 from face_features import crop_face_rgb
+from face_detector import detect_largest_face_scored
+from face_quality import face_quality
+from emotion_smoother import EmaSmoother
 
 MODEL    = "enet_b0_8_best_vgaf"
 EMOTIONS = ['Anger', 'Contempt', 'Disgust', 'Fear', 'Happiness', 'Neutral', 'Sadness', 'Surprise']
@@ -32,18 +35,20 @@ COLORS = {
     'Contempt':  (120,  80, 200),
 }
 
-cascade = cv2.CascadeClassifier(
-    cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
-)
+# box border colour by quality tier, independent of the emotion colour used for the label
+QUALITY_COLORS = [(0, 0, 230), (0, 200, 230), (0, 200, 0)]  # red / yellow / green
+QUALITY_THRESHOLDS = (0.35, 0.6)
 
 
-def detect_face(frame_bgr):
-    gray  = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
-    faces = cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
-    if len(faces) == 0:
-        return None
-    x, y, w, h = max(faces, key=lambda b: b[2] * b[3])
-    return (x, y, x + w, y + h)
+def quality_color(quality):
+    if quality is None:
+        return (150, 150, 150)
+    lo, hi = QUALITY_THRESHOLDS
+    if quality < lo:
+        return QUALITY_COLORS[0]
+    if quality < hi:
+        return QUALITY_COLORS[1]
+    return QUALITY_COLORS[2]
 
 
 def softmax(logits):
@@ -51,15 +56,16 @@ def softmax(logits):
     return e / e.sum()
 
 
-def draw_overlay(frame, box, scores, dominant):
+def draw_overlay(frame, box, scores, dominant, quality):
     h, w = frame.shape[:2]
     color = COLORS.get(dominant, (0, 255, 0))
 
-    # face box + label
+    # face box (border colour = quality tier) + emotion/quality label
     if box is not None:
         x1, y1, x2, y2 = box
-        cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-        cv2.putText(frame, dominant.upper(), (x1, max(y1 - 10, 20)),
+        cv2.rectangle(frame, (x1, y1), (x2, y2), quality_color(quality), 2)
+        q_text = f"  Q:{quality:.2f}" if quality is not None else ""
+        cv2.putText(frame, dominant.upper() + q_text, (x1, max(y1 - 10, 20)),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
 
     # sidebar bar chart
@@ -89,7 +95,9 @@ def main():
     box      = None
     scores   = {e: 0.0 for e in EMOTIONS}
     dominant = "Neutral"
+    quality  = None
     frame_n  = 0
+    smoother = EmaSmoother()
 
     while True:
         ret, frame = cap.read()
@@ -98,16 +106,18 @@ def main():
         frame_n += 1
 
         if frame_n % INFER_EVERY == 0:
-            b = detect_face(frame)
+            b, det_weight = detect_largest_face_scored(frame)
             if b is not None:
-                box = b
+                box     = b
+                quality = face_quality(frame, box, det_weight)
                 crop = crop_face_rgb(frame, box)
                 _, logits = fer.predict_emotions(crop, logits=True)
                 probs     = softmax(np.array(logits, dtype=float))
-                scores    = {name: float(probs[i]) for i, name in enumerate(EMOTIONS)}
+                smoothed  = smoother.update(probs, quality)
+                scores    = {name: float(smoothed[i]) for i, name in enumerate(EMOTIONS)}
                 dominant  = max(scores, key=scores.__getitem__)
 
-        draw_overlay(frame, box, scores, dominant)
+        draw_overlay(frame, box, scores, dominant, quality)
         cv2.imshow("Emotion", frame)
         if cv2.waitKey(1) == ord("q"):
             break

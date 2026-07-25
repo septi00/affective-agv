@@ -1,3 +1,4 @@
+import time
 import numpy as np
 from wrapped_kf import WrappedKalmanFilter1D, wrap
 
@@ -36,7 +37,8 @@ class MultiTracker:
                  gate_deg=20.0,
                  max_misses=15,
                  min_hits=3,
-                 spawn_conf=0.4):
+                 spawn_conf=0.4,
+                 inherit_ttl=30.0):
         self.dt = dt
         self.gate = np.deg2rad(gate_deg)
         self.max_misses = max_misses
@@ -44,6 +46,8 @@ class MultiTracker:
         self.spawn_conf = spawn_conf
         self.tracks = []
         self.next_id = 0
+        self._graveyard = []        # (angle_rad, id, death_time) of recently-dead confirmed tracks
+        self._inherit_ttl = inherit_ttl   # seconds to remember a dead track's ID
 
     def step(self, detections):
         # 1) Predict every track forward
@@ -82,16 +86,36 @@ class MultiTracker:
                 self.tracks[ti].confirmed = True
 
         # 4) Unmatched tracks: increment miss, drop stale
+        now = time.monotonic()
         for ti in unmatched_tracks:
             self.tracks[ti].misses += 1
+        for t in self.tracks:
+            if t.misses >= self.max_misses and t.confirmed:
+                self._graveyard.append((t.angle, t.id, now))
         self.tracks = [t for t in self.tracks if t.misses < self.max_misses]
+        self._graveyard = [(a, i, ts) for a, i, ts in self._graveyard
+                           if now - ts < self._inherit_ttl]
 
         # 5) Unmatched detections: spawn if confident enough
         for di in unmatched_dets:
             ang, conf = detections[di]
             if conf >= self.spawn_conf:
-                self.tracks.append(
-                    Track(self.next_id, self.dt, ang, conf))
-                self.next_id += 1
+                track_id = self._inherit_id(ang, now)
+                self.tracks.append(Track(track_id, self.dt, ang, conf))
 
         return [t for t in self.tracks if t.confirmed]
+
+    def _inherit_id(self, angle, now):
+        """Return a dead track's ID if one is nearby, else allocate a new one."""
+        best_gi, best_d = None, np.inf
+        for gi, (ga, gid, _) in enumerate(self._graveyard):
+            d = abs(wrap(angle - ga))
+            if d < best_d and d < self.gate:
+                best_d, best_gi = d, gi
+        if best_gi is not None:
+            inherited_id = self._graveyard[best_gi][1]
+            del self._graveyard[best_gi]
+            return inherited_id
+        new_id = self.next_id
+        self.next_id += 1
+        return new_id
