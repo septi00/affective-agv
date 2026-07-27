@@ -1,9 +1,46 @@
+"""
+pose_live.py
+Live OAK-D pose + body-affect features, one independent reading per person.
+
+WHAT CHANGED AND WHY: the previous version created a single PoseFeatures before
+the pipeline and called pf.update(pts) for every detection in the frame. That
+object is stateful (self.prev wrists, self.speeds window, self.open_hist), so
+with two people in frame it subtracted person A's wrist position from person B's
+and called the difference a velocity. Nobody had to move for that number to be
+large -- it was the distance between two bodies. `act` and `burst` pinned high,
+hot hit 2, and pose_emotion applied BOOST_HIGH on every frame regardless of
+posture. The single on-screen readout hid it, because every detection
+overwrote last_txt and only the final person's numbers were ever displayed.
+
+The fix is identity: PersonTracker assigns a stable ID per person, and
+PerTrackState hands each ID its own PoseFeatures. Temporal features are only
+meaningful within one person's history, so state is now keyed by who it
+belongs to.
+
+TargetSelector picks which person the robot attends to. Every track is still
+computed -- only the choice of which one drives behaviour and fusion is
+narrowed. Because state lives per track, attention can move back and forth with
+no reset and no cold start.
+
+TEST FOR THE FIX: two people, both standing still. `act` and `burst` should sit
+near zero for both. Before the fix they pin high. Worth capturing on video --
+that before/after is a figure.
+"""
+import sys, os
+
 import cv2
 import numpy as np
 import depthai as dai
 from depthai_nodes.node import ParsingNeuralNetwork
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(_HERE, "..", "common"))
+
 from pose_features import PoseFeatures
 from pose_emotion import OPEN_THRESH
+from person_tracker import PersonTracker, iou
+from per_track_state import PerTrackState
+from target_selector import TargetSelector
 
 ARCHIVE_PATH = "models/yolov8n-pose.rvc2.tar.xz"
 
@@ -24,6 +61,19 @@ SKELETON = [
 
 CONF_THRESH = 0.3
 NN_W, NN_H  = 512, 288
+
+# Tracker units are NN RESULTS, not display frames: update() is called once per
+# q_nn message, so max_age=15 means 15 pose inferences without a match.
+IOU_THRESH = 0.3
+MAX_AGE    = 15
+MIN_HITS   = 3
+
+# Attention: a challenger needs 25% more box area, held for 5 NN results.
+SEL_MARGIN   = 1.25
+SEL_PATIENCE = 5
+
+TARGET_COLOR = (0, 255, 255)     # attended person: yellow, thick
+OTHER_COLOR  = (200, 200, 0)     # everyone else: dim teal, thin
 
 # BGR colors: left side = greens/cyans, right side = reds/oranges, face = yellows
 KEYPOINT_COLORS = [
@@ -47,9 +97,114 @@ KEYPOINT_COLORS = [
 ]
 
 
+# ------------------------------------------------------------------ extraction
+
+def build_pts(det, depth_frame, intr):
+    """One detection -> {kp_index: (px, py, conf, x3d, y3d, z_m)}.
+
+    Pure extraction: no feature update, no drawing, no state. Splitting this out
+    is what lets keypoints be built for EVERY person first, and features updated
+    per track afterwards -- the two-pass structure the fix depends on."""
+    fx, fy, cx, cy = intr
+    pts = {}
+    for i, kp in enumerate(det.getKeypoints()):
+        px = int(kp.imageCoordinates.x * NN_W)
+        py = int(kp.imageCoordinates.y * NN_H)
+        conf = kp.confidence
+
+        if conf <= CONF_THRESH:
+            continue
+
+        if depth_frame is not None:
+            px_c = int(np.clip(px, 0, NN_W - 1))
+            py_c = int(np.clip(py, 0, NN_H - 1))
+            z_mm = depth_frame[py_c, px_c]
+            if z_mm > 0:
+                z_m = z_mm / 1000.0
+                pts[i] = (px, py, conf,
+                          (px - cx) * z_m / fx,
+                          (py - cy) * z_m / fy,
+                          z_m)
+                continue
+        pts[i] = (px, py, conf, None, None, None)
+    return pts
+
+
+def detection_index(tbox, boxes, used):
+    """Which detection a track matched to this frame.
+
+    The tracker returns the exact box it was handed, so the correct detection
+    scores IoU 1.0. Matching by best IoU rather than tuple equality keeps this
+    correct if boxes are ever rounded or scaled, and `used` enforces one
+    detection per track so identical boxes can't both claim the same person."""
+    best_i, best_v = None, 0.0
+    for i, b in enumerate(boxes):
+        if i in used:
+            continue
+        v = iou(tbox, b)
+        if v > best_v:
+            best_i, best_v = i, v
+    return best_i
+
+
+# -------------------------------------------------------------------- drawing
+
+def draw_skeleton(frame, pts, show_depth=False):
+    for a, b in SKELETON:
+        if a not in pts or b not in pts:
+            continue
+        xa, ya = pts[a][:2]
+        xb, yb = pts[b][:2]
+        ca, cb = KEYPOINT_COLORS[a], KEYPOINT_COLORS[b]
+        line_color = tuple(int((ca[j] + cb[j]) / 2) for j in range(3))
+        cv2.line(frame, (xa, ya), (xb, yb), line_color, 2)
+
+    for i, pt in pts.items():
+        px, py = pt[:2]
+        cv2.circle(frame, (px, py), 4, KEYPOINT_COLORS[i], -1)
+        # depth labels only on the attended person -- with several people the
+        # per-joint text covers the whole frame and nothing is readable
+        if show_depth and pt[5] is not None:
+            cv2.putText(frame, f"{pt[5]:.2f}m", (px + 5, py),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+
+def draw_person_box(frame, box, tid, is_target):
+    x1, y1, x2, y2 = (int(v) for v in box)
+    col = TARGET_COLOR if is_target else OTHER_COLOR
+    cv2.rectangle(frame, (x1, y1), (x2, y2), col, 3 if is_target else 1)
+    tag = f"T{tid}" + ("  <target>" if is_target else "")
+    cv2.putText(frame, tag, (x1, max(y1 - 6, 14)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.5, col, 2)
+
+
+def readout_line(tid, op, mean, burst, is_target):
+    """One text line per tracked person. Showing EVERY track, not just one, is
+    deliberate -- it is what makes the per-person independence visible, and what
+    would have exposed the shared-state bug immediately."""
+    mark = ">" if is_target else " "
+    if op is None:
+        return f"{mark}T{tid}  open --", (150, 150, 150)
+    state = "OPEN" if op > OPEN_THRESH else "CLOSED"
+    col = (0, 255, 0) if op > OPEN_THRESH else (0, 160, 255)
+    txt = f"{mark}T{tid}  open {op:.2f} [{state}]"
+    if mean is not None:
+        txt += f"   act {mean:.2f}  burst {burst:.2f}"
+    return txt, col
+
+
+def draw_readouts(frame, readouts):
+    y = 26
+    for tid in sorted(readouts):
+        txt, col = readouts[tid]
+        cv2.putText(frame, txt, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.55, col, 2)
+        y += 24
+
+
+# ----------------------------------------------------------------------- main
+
 def main():
     nn_archive = dai.NNArchive(ARCHIVE_PATH)
-    pf = None  # initialised after camera intrinsics are read
 
     try:
         with dai.Device() as device:
@@ -58,7 +213,12 @@ def main():
             fx, fy = intrinsics[0][0], intrinsics[1][1]
             cx, cy = intrinsics[0][2], intrinsics[1][2]
             cam_intrinsics = (fx, fy, cx, cy)
-            pf = PoseFeatures(intrinsics=cam_intrinsics)
+
+            tracker    = PersonTracker(iou_thresh=IOU_THRESH, max_age=MAX_AGE,
+                                       min_hits=MIN_HITS)
+            selector   = TargetSelector(margin=SEL_MARGIN, patience=SEL_PATIENCE)
+            # one PoseFeatures per tracked person, built on first sight
+            pose_state = PerTrackState(lambda: PoseFeatures(intrinsics=cam_intrinsics))
 
             with dai.Pipeline(device) as pipeline:
                 cam_rgb   = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
@@ -86,8 +246,7 @@ def main():
                 pipeline.start()
                 print("Running — press q to quit")
 
-                last_txt = None
-                last_col = (0, 255, 0)
+                readouts = {}
 
                 while True:
                     frame_data = q_frame.tryGet()
@@ -101,63 +260,39 @@ def main():
                     depth_frame = depth_data.getFrame() if depth_data is not None else None
 
                     if nn_data is not None:
-                        for det in nn_data.detections:
-                            x1 = int(det.xmin * NN_W)
-                            y1 = int(det.ymin * NN_H)
-                            x2 = int(det.xmax * NN_W)
-                            y2 = int(det.ymax * NN_H)
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), (200, 200, 0), 1)
+                        dets = list(nn_data.detections)
 
-                            pts = {}
-                            for i, kp in enumerate(det.getKeypoints()):
-                                px = int(kp.imageCoordinates.x * NN_W)
-                                py = int(kp.imageCoordinates.y * NN_H)
-                                conf = kp.confidence
+                        # --- pass 1: geometry for EVERYONE, no state touched ---
+                        boxes = [(int(d.xmin * NN_W), int(d.ymin * NN_H),
+                                  int(d.xmax * NN_W), int(d.ymax * NN_H)) for d in dets]
+                        pts_by_det = [build_pts(d, depth_frame, cam_intrinsics) for d in dets]
 
-                                if conf <= CONF_THRESH:
-                                    continue
+                        # --- identity, then attention ---
+                        tracks = tracker.update(boxes)
+                        target = selector.update(tracks)
 
-                                z_m = None
-                                if depth_frame is not None:
-                                    px_c = np.clip(px, 0, NN_W - 1)
-                                    py_c = np.clip(py, 0, NN_H - 1)
-                                    z_mm = depth_frame[py_c, px_c]
-                                    if z_mm > 0:
-                                        z_m = z_mm / 1000.0
-                                        x3d = (px - cx) * z_m / fx
-                                        y3d = (py - cy) * z_m / fy
-                                        pts[i] = (px, py, conf, x3d, y3d, z_m)
-                                        continue
-                                pts[i] = (px, py, conf, None, None, None)
+                        # --- pass 2: features per person, into that person's own state ---
+                        readouts = {}
+                        used = set()
+                        for tid, tbox in tracks:
+                            di = detection_index(tbox, boxes, used)
+                            if di is None:
+                                continue
+                            used.add(di)
+                            pts = pts_by_det[di]
 
-                            for a, b in SKELETON:
-                                if a not in pts or b not in pts:
-                                    continue
-                                xa, ya = pts[a][:2]
-                                xb, yb = pts[b][:2]
-                                ca, cb = KEYPOINT_COLORS[a], KEYPOINT_COLORS[b]
-                                line_color = tuple(int((ca[j] + cb[j]) / 2) for j in range(3))
-                                cv2.line(frame, (xa, ya), (xb, yb), line_color, 2)
+                            op, mean, burst = pose_state.get(tid).update(pts)
 
-                            for i, pt in pts.items():
-                                px, py = pt[:2]
-                                z_m = pt[5]
-                                cv2.circle(frame, (px, py), 4, KEYPOINT_COLORS[i], -1)
-                                if z_m is not None:
-                                    cv2.putText(frame, f"{z_m:.2f}m", (px + 5, py),
-                                                cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+                            is_target = (tid == target)
+                            draw_skeleton(frame, pts, show_depth=is_target)
+                            draw_person_box(frame, tbox, tid, is_target)
+                            readouts[tid] = readout_line(tid, op, mean, burst, is_target)
 
-                            op, mean, burst = pf.update(pts)
-                            if op is not None:
-                                state = "OPEN" if op > OPEN_THRESH else "CLOSED"
-                                last_txt = f"open {op:.2f}  [{state}]"
-                                if mean is not None:
-                                    last_txt += f"   act {mean:.2f}  burst {burst:.2f}"
-                                last_col = (0, 255, 0) if op > OPEN_THRESH else (0, 160, 255)
+                        # not optional: without this, every person who ever
+                        # walked past keeps a PoseFeatures alive for the whole run
+                        pose_state.evict(tracker.dead_ids)
 
-                    if last_txt is not None:
-                        cv2.putText(frame, last_txt, (10, 26), cv2.FONT_HERSHEY_SIMPLEX, 0.7,
-                                    last_col, 2)
+                    draw_readouts(frame, readouts)
 
                     cv2.imshow("Pose", frame)
                     if cv2.waitKey(1) == ord("q"):

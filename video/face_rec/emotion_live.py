@@ -16,23 +16,26 @@ import numpy as np
 from hsemotion_onnx.facial_emotions import HSEmotionRecognizer
 from face_features import crop_face_rgb
 from face_detector import detect_largest_face_scored
+from face_classifier import probs6, SIX
 from face_quality import face_quality
 from emotion_smoother import EmaSmoother
 
 MODEL    = "enet_b0_8_best_vgaf"
-EMOTIONS = ['Anger', 'Contempt', 'Disgust', 'Fear', 'Happiness', 'Neutral', 'Sadness', 'Surprise']
+# Display over the SAME 6 classes the rest of the system uses. probs6 drops
+# Surprise/Contempt exactly as face_perception / score_crema_d / fuse_crema_d
+# do -- so this demo's decision rule matches the thesis numbers instead of
+# letting Surprise win the argmax (the old 8-class bug).
+EMOTIONS = SIX
 INFER_EVERY = 4  # run inference every N frames; raise to 6-8 if too slow
 
-# BGR colours per emotion
+# BGR colours per emotion (keys = SIX)
 COLORS = {
-    'Happiness': (0,   220,   0),
-    'Neutral':   (180, 180, 180),
-    'Sadness':   (255, 100,   0),
-    'Anger':     (0,     0, 230),
-    'Fear':      (0,   140, 255),
-    'Disgust':   (0,   180, 100),
-    'Surprise':  (0,   200, 220),
-    'Contempt':  (120,  80, 200),
+    'happy':   (0,   220,   0),
+    'neutral': (180, 180, 180),
+    'sad':     (255, 100,   0),
+    'anger':   (0,     0, 230),
+    'fear':    (0,   140, 255),
+    'disgust': (0,   180, 100),
 }
 
 # box border colour by quality tier, independent of the emotion colour used for the label
@@ -49,11 +52,6 @@ def quality_color(quality):
     if quality < hi:
         return QUALITY_COLORS[1]
     return QUALITY_COLORS[2]
-
-
-def softmax(logits):
-    e = np.exp(logits - np.max(logits))
-    return e / e.sum()
 
 
 def draw_overlay(frame, box, scores, dominant, quality):
@@ -94,7 +92,7 @@ def main():
 
     box      = None
     scores   = {e: 0.0 for e in EMOTIONS}
-    dominant = "Neutral"
+    dominant = "neutral"
     quality  = None
     frame_n  = 0
     smoother = EmaSmoother()
@@ -112,7 +110,7 @@ def main():
                 quality = face_quality(frame, box, det_weight)
                 crop = crop_face_rgb(frame, box)
                 _, logits = fer.predict_emotions(crop, logits=True)
-                probs     = softmax(np.array(logits, dtype=float))
+                probs     = probs6(np.array(logits, dtype=float))   # 6-vector, SIX order
                 smoothed  = smoother.update(probs, quality)
                 scores    = {name: float(smoothed[i]) for i, name in enumerate(EMOTIONS)}
                 dominant  = max(scores, key=scores.__getitem__)
