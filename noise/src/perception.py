@@ -36,7 +36,9 @@ from config import (
 )
 from multi_tracker import MultiTracker
 from peak_picking import pick_peaks
-from sound_classifier import EmotionClassifier, SoundClassifier, YAMNET_FRAME
+from sound_classifier import (
+    CLASS_NAMES, EmotionClassifier, SoundClassifier, YAMNET_FRAME,
+)
 
 
 @dataclass
@@ -55,6 +57,7 @@ class SoundResult:
     is_speech: bool
     emotion: str | None = None
     emotion_conf: float | None = None
+    emotion_probs: np.ndarray | None = None   # 6-vector, CLASS_NAMES order
     sound_label: str | None = None
     sound_conf: float | None = None
 
@@ -111,8 +114,18 @@ class Perception:
 
     def _classify(self, window) -> SoundResult:
         if self.clf.speech_score(window) >= SPEECH_THRESH:
-            emotion, conf = self.ser.classify(window)
-            return SoundResult(is_speech=True, emotion=emotion, emotion_conf=conf)
+            # classify_probs, not classify: late fusion needs the whole
+            # distribution. An argmax label cannot be weighted against the face
+            # channel or multiplied by the body prior -- reducing here would
+            # throw away the only thing fusion can actually use, and the vector
+            # is computed either way. emotion/emotion_conf are still filled so
+            # run_live.py and any existing consumer are unaffected.
+            probs = self.ser.classify_probs(window)
+            i = int(probs.argmax())
+            return SoundResult(is_speech=True,
+                               emotion=CLASS_NAMES[i],
+                               emotion_conf=float(probs[i]),
+                               emotion_probs=probs)
         label, score = self.clf.classify(window)[0]
         return SoundResult(is_speech=False, sound_label=label, sound_conf=score)
 

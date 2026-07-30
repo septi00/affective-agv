@@ -3,15 +3,27 @@ face_perception.py
 Face-emotion perception core: one frame in, one FaceResult out.
 
 I/O-free and device-agnostic -- no camera, no drawing, no printing -- mirroring
-perception.py on the audio side. The live OAK-D runner will go through here.
+perception.py on the audio side. The live OAK-D runner goes through here.
 
-process(frame, box=None):
-  box=None  -> detect the largest face internally (Haar fallback)
-  box given -> use it as-is (e.g. the OAK-D's on-device face detector)
+process(frame, box=None, det_weight=None):
+  box=None       -> detect the largest face internally (Haar fallback)
+  box given      -> use it as-is (e.g. matched to a tracked person by
+                    face_pose_match, or from an on-device detector)
+  det_weight     -> the detector's own confidence for that external box
+
+WHY det_weight WAS ADDED: face_quality averages three signals -- box area,
+detector confidence, and frontality. Previously an externally supplied box
+carried no confidence, so that term was dropped and quality came from two
+signals instead of three. But detect_faces_scored already returns Haar's
+level-weight for every face, so in the multi-person path the number exists and
+was simply being thrown away. Since quality drives the fusion weights, losing a
+third of the signal weakened the thing the fusion design rests on. Still
+optional: an on-device detector with no comparable score passes None and the
+term is skipped, not defaulted.
 
 FaceResult carries the full 6-class probability vector, not just the winning
-label, so late fusion with the audio channel stays a plain weighted average of
-two 6-vectors in the SAME order [anger, disgust, fear, happy, neutral, sad].
+label, so late fusion with the audio channel stays a weighted average of
+6-vectors in the SAME order [anger, disgust, fear, happy, neutral, sad].
 
 NOTE ON PARITY WITH THE HARNESSES: this core reduces per frame (softmax to a
 6-vector). The offline harnesses instead SUM 8-logits across sampled frames and
@@ -53,8 +65,7 @@ class FacePerception:
     def __init__(self, model_name="enet_b0_8_best_vgaf"):
         self.clf = FaceClassifier(model_name=model_name)
 
-    def process(self, frame_bgr, box=None) -> FaceResult:
-        det_weight = None
+    def process(self, frame_bgr, box=None, det_weight=None) -> FaceResult:
         if box is None:
             box, det_weight = detect_largest_face_scored(frame_bgr)
         if box is None:
