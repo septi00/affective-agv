@@ -22,3 +22,8 @@ cnn_trainer/audio/models/
 .cache/
 .depthai_cached_models/
 video/pose_est/models/yolov8n-pose.pt
+
+# colcon build artifacts
+build/
+install/
+log/

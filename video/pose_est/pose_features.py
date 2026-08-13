@@ -35,6 +35,28 @@ def _xyz(pts, i):
     return None
 
 
+TORSO = [L_SH, R_SH, L_HIP, R_HIP]
+
+
+def torso_centroid(pts):
+    """Person anchor in the CAMERA frame, metres: mean of the torso joints
+    (shoulders + hips) that have valid stereo depth.
+
+    The torso is the largest, most depth-stable body region, so it gives the
+    steadiest proxemics anchor -- steadier than any single joint or the
+    bounding-box centre, which both drift with limb motion. This is the
+    (x, y, z) the navigation layer turns into a personal-space circle, after
+    the static camera->base transform.
+
+    Returns np.array([x, y, z]) in camera frame, or None if no torso joint has
+    valid 3D this frame.
+    """
+    valid = [p for p in (_xyz(pts, i) for i in TORSO) if p is not None]
+    if not valid:
+        return None
+    return np.mean(valid, axis=0)
+
+
 def _est_xyz(pts, i, fallback_z, intrinsics):
     """Best-effort 3D position: use stored 3D if valid, else reproject pixel
     position at fallback_z using camera intrinsics."""

@@ -1,0 +1,18 @@
+<?xml version="1.0"?>
+<package format="3">
+  <name>proxemics_bringup</name>
+  <version>0.0.1</version>
+  <description>Nav2 bringup with the affect-modulated proxemics costmap layer</description>
+  <maintainer email="septi@example.com">Septimiu</maintainer>
+  <license>MIT</license>
+
+  <buildtool_depend>ament_cmake</buildtool_depend>
+
+  <exec_depend>nav2_bringup</exec_depend>
+  <exec_depend>proxemics_layer</exec_depend>
+  <exec_depend>proxemics_sim</exec_depend>
+
+  <export>
+    <build_type>ament_cmake</build_type>
+  </export>
+</package>

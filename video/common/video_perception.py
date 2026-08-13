@@ -37,8 +37,11 @@ from target_selector import TargetSelector
 from face_pose_match import match_face
 from face_detector import detect_faces_scored
 from face_perception import FacePerception
-from pose_features import PoseFeatures
+from pose_features import PoseFeatures, torso_centroid
 from pose_emotion import body_prior
+from emotion_smoother import EmaSmoother
+import proxemics
+import robot_frame
 import late_fusion
 from late_fusion import SIX
 
@@ -47,6 +50,7 @@ from late_fusion import SIX
 class PersonResult:
     track_id: int
     box: tuple                              # person box, (x1,y1,x2,y2)
+    centroid_xyz: np.ndarray | None = None  # person anchor, CAMERA frame, metres (torso mean)
 
     # --- face channel: the {probs6, available, quality} contract ---
     face_probs: np.ndarray | None = None
@@ -62,7 +66,11 @@ class PersonResult:
     burst: float | None = None
 
     # --- fusion output ---
-    fused: np.ndarray = field(default_factory=late_fusion.uniform)
+    fused: np.ndarray = field(default_factory=late_fusion.uniform)   # TEMPORALLY SMOOTHED -- use this
+    fused_raw: np.ndarray = field(default_factory=late_fusion.uniform)  # this frame only, pre-EMA (debug)
+
+    # --- navigation output: affect-scaled personal space ---
+    circle: object | None = None            # ProxemicsCircle, base frame. None if no metric position.
     label: str = 'neutral'
     weights: list = field(default_factory=list)   # normalised peer weights, for display
 
@@ -75,6 +83,13 @@ class PersonResult:
 class VideoResult:
     people: list                            # list[PersonResult], everyone tracked
     target_id: int | None                   # attended person
+
+    @property
+    def circles(self) -> list:
+        """Every person's proxemics circle this frame, base frame, skipping
+        anyone without a valid metric position. This is the ONLY thing the
+        navigation layer needs from perception -- publish this list."""
+        return [p.circle for p in self.people if p.circle is not None]
 
     @property
     def target(self):
@@ -113,6 +128,11 @@ class VideoPerception:
         self.tracker = PersonTracker()
         self.selector = TargetSelector()
         self.pose_state = PerTrackState(lambda: PoseFeatures(intrinsics=intrinsics))
+        # one EMA per tracked person: an average is only meaningful over ONE
+        # person's readings. Sharing a smoother across people blends strangers.
+        self.fused_ema = PerTrackState(EmaSmoother)
+        # safety ratchet on top of the EMA: expand fast, shrink slow.
+        self.radius_smooth = PerTrackState(proxemics.RadiusSmoother)
         self.face_min_size = face_min_size
         self.min_contain = min_contain
 
@@ -147,6 +167,13 @@ class VideoPerception:
 
             r = PersonResult(track_id=tid, box=tbox)
 
+            # ---- metric position: person anchor in camera frame ----
+            # torso mean, metres. The nav layer turns this into a proxemics
+            # circle after the static camera->base transform. None when no
+            # torso joint has valid depth this frame (planner should hold the
+            # last good position or skip the circle rather than trust a guess).
+            r.centroid_xyz = torso_centroid(pts_by_det[di])
+
             # ---- body channel: this person's own temporal state ----
             op, mean, burst = self.pose_state.get(tid).update(pts_by_det[di])
             r.openness, r.activity, r.burst = op, mean, burst
@@ -174,12 +201,38 @@ class VideoPerception:
                     peers.append((a_probs, a_quality))
 
             r.weights = late_fusion.weights_of(peers)
-            r.fused = late_fusion.fuse(peers, r.body_prior)
+            r.fused_raw = late_fusion.fuse(peers, r.body_prior)
+
+            # ---- temporal smoothing: the root fix for frame-to-frame popping --
+            # Affect is recomputed from scratch every frame, so a blink or head
+            # turn can flip the argmax and, downstream, make the proxemics
+            # radius jump ~1 m several times a second. Smoothing HERE (not at
+            # the radius) fixes the label and every consumer at once.
+            # Weighted by this frame's best peer quality, so a confident read
+            # pulls the average quickly and a poor one barely nudges it; with
+            # no peer at all (body-only or nothing) the reading is untrusted
+            # and merely drifts the average instead of resetting it.
+            conf = max((q for _p, q in peers), default=0.0)
+            r.fused = self.fused_ema.get(tid).update(r.fused_raw, conf)
             r.label = late_fusion.label_of(r.fused)
+
+            # ---- navigation: affect -> personal-space circle ----------------
+            # Camera-frame anchor -> robot base frame -> radius from the
+            # SMOOTHED affect. None when this person has no valid depth this
+            # frame; the planner holds their last circle rather than guessing.
+            r.circle = proxemics.circle_for(
+                track_id=tid,
+                ground_xy=robot_frame.ground_xy(r.centroid_xyz),
+                fused=r.fused,
+                label=r.label,
+                smoother=self.radius_smooth.get(tid),
+            )
             results.append(r)
 
         # without this, every person who ever passed the robot keeps a
         # PoseFeatures with a 15-frame deque alive for the whole run
         self.pose_state.evict(self.tracker.dead_ids)
+        self.fused_ema.evict(self.tracker.dead_ids)
+        self.radius_smooth.evict(self.tracker.dead_ids)
 
         return VideoResult(people=results, target_id=target)
