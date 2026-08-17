@@ -1,0 +1,9 @@
+<library path="libproxemics_layer_ros1">
+  <class type="proxemics_layer::ProxemicLayer" base_class_type="costmap_2d::Layer">
+    <description>
+      Affect-modulated proxemics soft-cost layer. Rasterizes per-person
+      Gaussian cost bumps whose width tracks each person's personal-space
+      radius, capped below lethal so paths bend around people.
+    </description>
+  </class>
+</library>
