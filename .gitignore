@@ -13,15 +13,15 @@ __pycache__/
 .idea/
 
 # Datasets (large data + nested git repos)
-cnn_trainer/datasets/
+perception/cnn_trainer/datasets/
 
 # Trained model weights (cnn_trainer only — noise/models/ is tracked)
-cnn_trainer/audio/models/
+perception/cnn_trainer/audio/models/
 
 # Runtime caches and downloaded model weights
 .cache/
 .depthai_cached_models/
-video/pose_est/models/yolov8n-pose.pt
+perception/video/pose_est/models/yolov8n-pose.pt
 
 # colcon build artifacts
 build/

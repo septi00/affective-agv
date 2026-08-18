@@ -23,7 +23,7 @@ which keeps run_live.py and run_video.py using literally the same perception
 core rather than two drifting copies.
 
 DEVICE NOTE: the ReSpeaker lives on the robot. This can only run on the CM5, not
-the MacBook -- unlike everything else in common/, it cannot be tested offline.
+the MacBook it cannot be tested offline.
 """
 from __future__ import annotations
 

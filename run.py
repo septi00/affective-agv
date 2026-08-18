@@ -24,16 +24,17 @@ The audio path reuses noise/src/perception.py unchanged -- the same core
 run_live.py drives. Two front-ends over one perception core, which is the whole
 reason that file is I/O-free.
 
-AUDIO IS ROBOT-ONLY. The ReSpeaker is on the CM5. Set USE_AUDIO=False (or just
-run without the mic attached) to fall back to face+body on the MacBook -- the
-fusion call is identical, audio simply reports unavailable.
+AUDIO NEEDS THE RESPEAKER PLUGGED IN. Normally that's the CM5, but the ReSpeaker
+also works over USB on the MacBook. Set USE_AUDIO=False (or just run without the
+mic attached) to fall back to face+body -- the fusion call is identical, audio
+simply reports unavailable.
 
 Run from the repo root:
     python run.py
 Press q to quit.
 
-Paths below are relative to the ROOT, not to video/. If this file is ever moved
-back inside video/, the sys.path block and the two model paths are the only
+Paths below are relative to the ROOT. If this file is ever moved
+from the root folder, the sys.path block and the two model paths are the only
 things that change.
 """
 import sys, os, time
@@ -44,10 +45,11 @@ import depthai as dai
 from depthai_nodes.node import ParsingNeuralNetwork
 
 _HERE = os.path.dirname(os.path.abspath(__file__))          # repo root
-for _p in (os.path.join("video", "common"),
-           os.path.join("video", "pose_est"),
-           os.path.join("video", "face_rec", "src"),
-           os.path.join("noise", "src")):                    # audio core, imported not copied
+for _p in (os.path.join("perception", "fusion"),             # shared fusion core + audio bridge
+           os.path.join("perception", "video", "common"),
+           os.path.join("perception", "video", "pose_est"),
+           os.path.join("perception", "video", "face_rec", "src"),
+           os.path.join("perception", "noise", "src")):      # audio core, imported not copied
     sys.path.insert(0, os.path.join(_HERE, _p))
 
 import urllib.request  # fixes hsemotion-onnx 0.3.1 download bug; keep BEFORE the lib
@@ -56,7 +58,7 @@ from late_fusion import SIX
 from open_oakd import open_device
 from audio_bridge import AudioBridge
 
-ARCHIVE_PATH = os.path.join(_HERE, "video", "pose_est", "models",
+ARCHIVE_PATH = os.path.join(_HERE, "perception", "video", "pose_est", "models",
                             "yolov8n-pose.rvc2.tar.xz")
 
 CONF_THRESH = 0.3
@@ -72,7 +74,7 @@ if USE_ROS:
     import rospy
     from circle_publisher import CirclePublisher
 
-AUDIO_MODELS = os.path.join(_HERE, "noise", "models")
+AUDIO_MODELS = os.path.join(_HERE, "perception", "noise", "models")
 YAMNET_PATH  = os.path.join(AUDIO_MODELS, "yamnet.tflite")
 YAMNET_MAP   = os.path.join(AUDIO_MODELS, "yamnet_class_map.csv")
 SER_PATH     = os.path.join(AUDIO_MODELS, "emotion_fusion_resnet18_merged.pt")
@@ -176,7 +178,7 @@ def draw_skeleton(frame, pts):
 
 class Reporter:
     """The only place a PerceptionResult becomes stdout, mirroring _report() in
-    run_live.py. Keeps printing out of the perception and drawing code."""
+    pose_live.py. Keeps printing out of the perception and drawing code."""
 
     def __init__(self, every_s=REPORT_EVERY_S):
         self.every_s = every_s
