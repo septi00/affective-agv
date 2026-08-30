@@ -57,6 +57,7 @@ from video_perception import VideoPerception
 from late_fusion import SIX
 from open_oakd import open_device
 from audio_bridge import AudioBridge
+from circle_relay_sender import CircleRelaySender
 
 ARCHIVE_PATH = os.path.join(_HERE, "perception", "video", "pose_est", "models",
                             "yolov8n-pose.rvc2.tar.xz")
@@ -68,11 +69,11 @@ NN_W, NN_H  = 512, 288
 # False = face + body only. Use on the MacBook, or to isolate a video problem
 # without the mic in the picture.
 USE_AUDIO   = True
-USE_ROS = True   # False on the Mac (no ROS), True on the robot
 
-if USE_ROS:
-    import rospy
-    from circle_publisher import CirclePublisher
+# True = no GUI window (headless CM5 / SSH / study runs). Skips every cv2
+# imshow/draw/waitKey so it needs no display. Circles still compute and
+# relay exactly the same -- the window was only ever for eyeballing.
+HEADLESS    = False
 
 AUDIO_MODELS = os.path.join(_HERE, "perception", "noise", "models")
 YAMNET_PATH  = os.path.join(AUDIO_MODELS, "yamnet.tflite")
@@ -297,7 +298,7 @@ def start_audio():
         return None
 
 
-def run_session(nn_archive, audio, reporter, circle_pub=None):
+def run_session(nn_archive, audio, reporter, relay):
     """One device session. Returns True if the user quit, False if the link
     dropped and a reconnect is worth trying.
 
@@ -356,9 +357,7 @@ def run_session(nn_archive, audio, reporter, circle_pub=None):
                         # queues at once. Frames arrive every ~33 ms, so 1 ms
                         # costs nothing.
                         time.sleep(0.001)
-                        # keep the window responsive even when frames stall,
-                        # otherwise q only works while data is flowing
-                        if cv2.waitKey(1) == ord("q"):
+                        if not HEADLESS and cv2.waitKey(1) == ord("q"):
                             return True
                         continue
 
@@ -382,28 +381,28 @@ def run_session(nn_archive, audio, reporter, circle_pub=None):
                         # replayed as current.
                         audio_now = audio.latest() if audio else (None, False, 0.0)
                         result = vp.process(frame, people, audio=audio_now)
-                        if circle_pub is not None:
-                            circle_pub.publish(result)
+                        relay.send(result)  # ship circles to the Pi4 over the cable
                         reporter.maybe(result, audio_now,
                                        audio.tracks() if audio else [])
 
-                        for (_box, pts) in people:
-                            draw_skeleton(frame, pts)
+                        if not HEADLESS:
+                            for (_box, pts) in people:
+                                draw_skeleton(frame, pts)
 
-                    if result is not None:
-                        for r in result.people:
-                            draw_person(frame, r, r.track_id == result.target_id)
-                        draw_channels(frame, result)
-                        if result.target is not None:
-                            draw_bars(frame, result.target)
-                    draw_audio(frame,
-                               audio.latest() if audio else (None, False, 0.0),
-                               audio.age if audio else float("inf"),
-                               audio.tracks() if audio else [])
-
-                    cv2.imshow("run", frame)
-                    if cv2.waitKey(1) == ord("q"):
-                        return True
+                    if not HEADLESS:
+                        if result is not None:
+                            for r in result.people:
+                                draw_person(frame, r, r.track_id == result.target_id)
+                            draw_channels(frame, result)
+                            if result.target is not None:
+                                draw_bars(frame, result.target)
+                        draw_audio(frame,
+                                   audio.latest() if audio else (None, False, 0.0),
+                                   audio.age if audio else float("inf"),
+                                   audio.tracks() if audio else [])
+                        cv2.imshow("run", frame)
+                        if cv2.waitKey(1) == ord("q"):
+                            return True
     except KeyboardInterrupt:
         return True
     except RuntimeError as e:
@@ -419,19 +418,12 @@ def main():
     nn_archive = dai.NNArchive(ARCHIVE_PATH)
     audio = start_audio()
     reporter = Reporter()
-
-    circle_pub = None
-    if USE_ROS:
-        try:
-            rospy.init_node("perception", anonymous=True, disable_signals=True)
-            circle_pub = CirclePublisher()
-        except Exception as e:
-            print(f"[ros disabled] {e}")
+    relay = CircleRelaySender()
 
     try:
         attempt = 0
         while True:
-            if run_session(nn_archive, audio, reporter, circle_pub):
+            if run_session(nn_archive, audio, reporter, relay):
                 break
             attempt += 1
             if attempt >= MAX_RECONNECTS:
