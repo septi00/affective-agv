@@ -24,6 +24,16 @@ The audio path reuses noise/src/perception.py unchanged -- the same core
 run_live.py drives. Two front-ends over one perception core, which is the whole
 reason that file is I/O-free.
 
+REAL DOA-TO-PERSON AUDIO ATTRIBUTION. Audio is scene-level -- the mic array
+produces ONE reading, not one per person. This loop passes AudioBridge's DOA
+tracks into VideoPerception.process(), which matches the currently-active DOA
+bearing against each tracked person's on-screen bearing (perception/fusion/
+bearing.py), so whoever is actually speaking gets the audio even when someone
+else has the camera's attention -- rather than just gluing it onto whichever
+person TargetSelector happens to be looking at. This depends on the
+MIC_OFFSET_DEG / MIC_SIGN mounting-offset calibration below; see the comment
+above those constants for how to re-calibrate after a mount change.
+
 AUDIO NEEDS THE RESPEAKER PLUGGED IN. Normally that's the CM5, but the ReSpeaker
 also works over USB on the MacBook. Set USE_AUDIO=False (or just run without the
 mic attached) to fall back to face+body -- the fusion call is identical, audio
@@ -74,6 +84,35 @@ USE_AUDIO   = True
 # imshow/draw/waitKey so it needs no display. Circles still compute and
 # relay exactly the same -- the window was only ever for eyeballing.
 HEADLESS    = False
+
+# Mic-to-camera bearing calibration -- see bearing.py's module docstring.
+# MIC_SIGN=-1.0 CONFIRMED from field data (2026-08-30 test run): with
+# MIC_SIGN=+1.0, cam and brg T0 consistently landed on OPPOSITE signs once
+# the speaker moved off-centre (e.g. cam -16.1 vs brg 24.0), which is the
+# sign-flip failure pattern, not offset error. Negating cam brought most
+# readings within a few degrees of brg (e.g. that same pair becomes 16.1 vs
+# 24.0). MIC_OFFSET_DEG left at 0.0 -- residual across ~12 clean (low-std)
+# readings clustered noisily around -2 deg, within the noise floor described
+# below, so 0.0 is as good a starting point as a false-precision fit.
+#
+# THE REMAINING SCATTER IS REAL ACOUSTIC NOISE, NOT A MATH BUG: even at the
+# right sign, readings varied by 5-20 deg frame to frame, and a low-confidence
+# ghost track repeatedly showed up around +/-165-175 deg (std 10-23 deg) --
+# classic SRP-PHAT front-back ambiguity / room reflection for a planar array.
+# active_doa_track()'s tie-break on tightest std_deg already favours the real
+# speaker over that ghost most of the time. If "A->nobody" is still too
+# frequent after this fix, widen gate_deg in the match_person() call inside
+# video_perception.py (currently the 20-degree default) before suspecting the
+# sign/offset again -- the sign is what caused the original symptom
+# (works dead-centre, fails to the side); this is a separate, smaller effect.
+#
+# Re-calibrate by watching cam vs brg T{id} in the console: at rest, cam
+# should sit close to brg; if it doesn't, adjust MIC_OFFSET_DEG by the
+# consistent residual. If cam goes the wrong way again as you move, MIC_SIGN
+# needs flipping back -- unlikely now, but the "cam"/"brg" line exists
+# precisely so a future mount change can be re-diagnosed the same way.
+MIC_OFFSET_DEG = 0.0
+MIC_SIGN       = -1.0
 
 AUDIO_MODELS = os.path.join(_HERE, "perception", "noise", "models")
 YAMNET_PATH  = os.path.join(AUDIO_MODELS, "yamnet.tflite")
@@ -194,10 +233,14 @@ class Reporter:
             return
         self._last_t = now
         self._last_label = label
-        print(self._line(target, audio_now, doa), flush=True)
+        audio_tid = result.audio_target_id if result is not None else None
+        cam_deg = result.audio_cam_deg if result is not None else None
+        person_bearings = result.person_bearings if result is not None else {}
+        print(self._line(target, audio_now, doa, audio_tid, cam_deg, person_bearings),
+              flush=True)
 
     @staticmethod
-    def _line(target, audio_now, doa):
+    def _line(target, audio_now, doa, audio_tid, cam_deg=None, person_bearings=None):
         _probs, a_avail, a_quality = audio_now
         parts = [time.strftime("%H:%M:%S")]
 
@@ -212,6 +255,24 @@ class Reporter:
             a = f"A {a_quality:.2f}" if a_avail else "A  -- "
             parts.append(f"{f}  {b}  {a}")
 
+        # CALIBRATION: cam_deg is the active DOA track converted through
+        # MIC_OFFSET_DEG/MIC_SIGN; brg T{id} is that same person's own
+        # camera_bearing_deg from their box. Once calibrated, cam_deg should
+        # sit close to the speaking person's own brg value. If it doesn't --
+        # or if it moves the WRONG way as you move -- MIC_OFFSET_DEG/MIC_SIGN
+        # need adjusting; see the comment above MIC_OFFSET_DEG at the top of
+        # this file.
+        if cam_deg is not None:
+            parts.append(f"cam {cam_deg:6.1f}deg")
+        if person_bearings:
+            parts.append("brg " + "  ".join(
+                f"T{tid} {v:6.1f}" for tid, v in sorted(person_bearings.items())))
+
+        # who the audio actually got attributed to -- may differ from the
+        # attended target (T above); that gap is the point of the DOA match.
+        if a_avail:
+            parts.append(f"A->T{audio_tid}" if audio_tid is not None else "A->nobody")
+
         if doa:
             parts.append("DOA " + "  ".join(
                 f"S{t.id} {t.angle_deg:6.1f}deg +/-{t.std_deg:.1f}" for t in doa))
@@ -221,15 +282,19 @@ class Reporter:
         return "  |  ".join(parts)
 
 
-def draw_audio(frame, audio, age, doa=()):
-    """Audio is ONE reading for the scene, not per person: the mic array cannot
-    yet say which tracked person spoke, so it is applied to the attended person
-    only. Closing that gap means matching a DOA bearing against the target's
-    pixel-x through the camera FOV -- the remaining piece of the association
-    story, and the reason this line is drawn separately from the per-person
-    ones rather than alongside them."""
+def draw_audio(frame, audio, age, doa=(), attributed_tid=None):
+    """Audio is ONE reading for the scene: the SER classifies a single
+    beamformed channel, so there is one vector to place per window. Which
+    tracked person it gets attached to is decided by bearing-matching the
+    active DOA track against each person's on-screen angle (bearing.py) --
+    attributed_tid is that decision, shown here so a mismatch (or a speaker
+    matching nobody) is visible instead of silently glued onto the target."""
     _probs, avail, quality = audio
     txt = f" A {quality:.2f}  ({age:.1f}s)" if avail else " A  --"
+    if attributed_tid is not None:
+        txt += f"  -> T{attributed_tid}"
+    elif avail:
+        txt += "  -> nobody (off-camera or unmatched)"
     if doa:
         txt += "   DOA " + " ".join(f"S{t.id} {t.angle_deg:.0f}deg" for t in doa)
     col = (0, 220, 220) if avail else (120, 120, 120)
@@ -315,7 +380,8 @@ def run_session(nn_archive, audio, reporter, relay):
             cam_intrinsics = (intr[0][0], intr[1][1], intr[0][2], intr[1][2])
 
             print("Loading face model (HSEmotion) …")
-            vp = VideoPerception(intrinsics=cam_intrinsics, face_min_size=FACE_MIN_SIZE)
+            vp = VideoPerception(intrinsics=cam_intrinsics, face_min_size=FACE_MIN_SIZE,
+                                 mic_offset_deg=MIC_OFFSET_DEG, mic_sign=MIC_SIGN)
 
             with dai.Pipeline(device) as pipeline:
                 cam_rgb   = pipeline.create(dai.node.Camera).build(dai.CameraBoardSocket.CAM_A)
@@ -380,10 +446,10 @@ def run_session(nn_archive, audio, reporter, relay):
                         # stopped audio worker drops out instead of being
                         # replayed as current.
                         audio_now = audio.latest() if audio else (None, False, 0.0)
-                        result = vp.process(frame, people, audio=audio_now)
+                        doa_now = audio.tracks() if audio else []
+                        result = vp.process(frame, people, audio=audio_now, doa_tracks=doa_now)
                         relay.send(result)  # ship circles to the Pi4 over the cable
-                        reporter.maybe(result, audio_now,
-                                       audio.tracks() if audio else [])
+                        reporter.maybe(result, audio_now, doa_now)
 
                         if not HEADLESS:
                             for (_box, pts) in people:
@@ -399,7 +465,8 @@ def run_session(nn_archive, audio, reporter, relay):
                         draw_audio(frame,
                                    audio.latest() if audio else (None, False, 0.0),
                                    audio.age if audio else float("inf"),
-                                   audio.tracks() if audio else [])
+                                   audio.tracks() if audio else [],
+                                   attributed_tid=result.audio_target_id if result else None)
                         cv2.imshow("run", frame)
                         if cv2.waitKey(1) == ord("q"):
                             return True

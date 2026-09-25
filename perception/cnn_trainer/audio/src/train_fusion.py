@@ -1,5 +1,24 @@
+"""
+train_fusion.py
+Small CNN WITH feature fusion -- log-mel + pitch + zero-crossing-rate,
+3 channels. Set DATASET below to pick children (BESD) only or the merged
+child+adult (BESD+CREMA-D) data. Companion to train_plain.py (same
+architecture minus the 2 extra channels, isolating feature fusion as the
+single variable under test) and train_resnet.py (ResNet18 backbone on the
+same fusion features).
+
+Replaces the old train_fusion.py (children-only) and train_fusion_combined.py
+(merged) -- same math, one file, one place to configure. DATASET_CFG below
+carries over each mode's original recipe unchanged (class weighting, weight
+decay, LR scheduling) rather than blending them, so results stay comparable
+to earlier runs.
+
+Evaluation (confusion matrix, per-domain breakdown) lives in eval.py, not
+here -- this script only trains and saves weights.
+"""
 import os
 import re
+import csv
 import glob
 import numpy as np
 import torch
@@ -8,23 +27,42 @@ import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader
 from tqdm import tqdm
 
-# IMPORTANT: Only importing the function now, defining dictionaries locally below.
 from features_fusion import wav_to_fusion_tensor
 
-DATA_DIR = "/Users/septi/dis_ws/cnn_trainer/besd"
+# --- SET THIS: "children" = BESD only, "combined" = BESD + CREMA-D merged
+DATASET = "children"
+
+EPOCHS = 40
+SAVE_HISTORY = False   # True: also write ../results/<tag>_history.csv per epoch (for plot_training_curves.py)
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+CHILD_DATA_DIR = os.path.join(_HERE, "..", "..", "datasets", "besd")
+ADULT_DATA_DIR = os.path.join(_HERE, "..", "..", "datasets", "crema-d", "AudioWAV")
+_RESULTS_DIR = os.path.join(_HERE, "..", "results")
+_MODELS_DIR = os.path.join(_HERE, "..", "models")
+
+DATASET_CFG = {
+    "children": dict(
+        class_weights=None, weight_decay=0.0, use_scheduler=False,
+        weights_file="emotion_fusion_cnn.pt", desc="children (BESD) only",
+    ),
+    "combined": dict(
+        class_weights=[1.0, 1.5, 1.5, 1.0, 1.0, 1.0], weight_decay=1e-4, use_scheduler=True,
+        weights_file="emotion_fusion_cnn_merged.pt", desc="merged child (BESD) + adult (CREMA-D) data",
+    ),
+}
 
 EMOTIONS = {
-    "angry": 0,
+    "angry":   0,
     "disgust": 1,
-    "fear": 2,
-    "happy": 3,
+    "fear":    2,
+    "happy":   3,
     "neutral": 4,
-    "sad": 5,
+    "sad":     5,
 }
 
 CLASS_NAMES = ["anger", "disgust", "fear", "happy", "neutral", "sad"]
 
-# Configure Apple Silicon GPU Hardware targeting
 device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
 print(f"Hardware execution engine active on device: {device}")
 
@@ -41,7 +79,7 @@ class SpeechEmotionDataset(Dataset):
         return self.X[idx], self.y[idx]
 
 
-def parse_filename(path):
+def parse_child_filename(path):
     name = os.path.splitext(os.path.basename(path))[0].strip()
     low = name.lower()
     emotion = next((e for e in EMOTIONS if e in low), None)
@@ -53,30 +91,66 @@ def parse_filename(path):
     if len(rest) < 2:
         return None
 
-    language = rest[0].upper()
     gender = rest[1].upper()
-
     m = re.search(r"\d+", rest[2:])
     age = m.group() if m else "0"
 
-    speaker_id = f"{gender}_{age}_{serial}"
-    return language, emotion, speaker_id
+    speaker_id = f"child_{gender}_{age}_{serial}"
+    return emotion, speaker_id
+
+
+def parse_cremad_filename(path):
+    name = os.path.splitext(os.path.basename(path))[0].strip()
+    parts = name.split("_")
+
+    if len(parts) != 4:
+        return None
+
+    actor_id = parts[0]
+    raw_emotion = parts[2]
+
+    crema_map = {
+        "ANG": 0, "DIS": 1, "FEA": 2, "HAP": 3, "NEU": 4, "SAD": 5,
+    }
+    if raw_emotion not in crema_map:
+        return None
+
+    emotion_id = crema_map[raw_emotion]
+    speaker_id = f"adult_actor_{actor_id}"
+    return emotion_id, speaker_id
 
 
 def load_dataset():
-    files = glob.glob(os.path.join(DATA_DIR, "**", "*.wav"), recursive=True)
-    if not files:
-        raise SystemExit(f"No .wav files found under '{DATA_DIR}'. Check the path.")
-
     X, y, speakers = [], [], []
-    for path in tqdm(files, desc="Extracting 3-Channel Fusion Tensors"):
-        parsed = parse_filename(path)
+
+    child_files = glob.glob(os.path.join(CHILD_DATA_DIR, "**", "*.wav"), recursive=True)
+    if not child_files:
+        raise SystemExit(f"No .wav files found under '{CHILD_DATA_DIR}'. Check the path.")
+    print(f"Found {len(child_files)} child audio files.")
+    for path in tqdm(child_files, desc="Extracting fusion tensors (child)"):
+        parsed = parse_child_filename(path)
         if parsed is None:
             continue
-        language, emotion, speaker = parsed
+        emotion, speaker = parsed
         X.append(wav_to_fusion_tensor(path))
         y.append(EMOTIONS[emotion])
         speakers.append(speaker)
+
+    if DATASET == "combined":
+        if os.path.exists(ADULT_DATA_DIR):
+            adult_files = glob.glob(os.path.join(ADULT_DATA_DIR, "**", "*.wav"), recursive=True)
+            print(f"\nFound {len(adult_files)} adult audio files.")
+            for path in tqdm(adult_files, desc="Extracting fusion tensors (adult)"):
+                parsed = parse_cremad_filename(path)
+                if parsed is None:
+                    continue
+                emotion_id, speaker = parsed
+                X.append(wav_to_fusion_tensor(path))
+                y.append(emotion_id)
+                speakers.append(speaker)
+        else:
+            print(f"\n[Warning] Adult directory not found at '{ADULT_DATA_DIR}'. Skipping adult data.")
+
     return X, np.array(y), speakers
 
 
@@ -101,8 +175,11 @@ def split_train_test(X, y, speakers):
 
 
 class EmotionFusionCNN(nn.Module):
+    """Same shape as train_plain.py's EmotionPlainCNN, with 2 extra input
+    channels (pitch, zero-crossing-rate) on top of the log-mel channel."""
+
     def __init__(self):
-        super(EmotionFusionCNN, self).__init__()
+        super().__init__()
         self.features = nn.Sequential(
             nn.Conv2d(3, 16, kernel_size=3, padding=1),
             nn.BatchNorm2d(16),
@@ -117,10 +194,9 @@ class EmotionFusionCNN(nn.Module):
             nn.Conv2d(32, 64, kernel_size=3, padding=1),
             nn.BatchNorm2d(64),
             nn.ReLU(),
-            nn.MaxPool2d(2)  # <-- CHANGED: Standard Pooling. Out: (64, 8, 11)
+            nn.MaxPool2d(2)  # Out: (64, 8, 11)
         )
         self.classifier = nn.Sequential(
-            # CHANGED: 64 channels * 8 height * 11 width = 5632
             nn.Linear(64 * 8 * 11, 64),
             nn.ReLU(),
             nn.Dropout(0.3),
@@ -134,6 +210,9 @@ class EmotionFusionCNN(nn.Module):
 
 
 def main():
+    cfg = DATASET_CFG[DATASET]
+    print(f"=== Plain CNN + feature fusion, {cfg['desc']} ===\n")
+
     X, y, speakers = load_dataset()
     X_train, y_train, X_test, y_test = split_train_test(X, y, speakers)
 
@@ -141,13 +220,21 @@ def main():
     test_loader = DataLoader(SpeechEmotionDataset(X_test, y_test), batch_size=32, shuffle=False)
 
     model = EmotionFusionCNN().to(device)
-    criterion = nn.CrossEntropyLoss()
-    optimizer = optim.Adam(model.parameters(), lr=0.001)
+    if cfg["class_weights"] is not None:
+        weights = torch.tensor(cfg["class_weights"], dtype=torch.float32).to(device)
+        criterion = nn.CrossEntropyLoss(weight=weights)
+    else:
+        criterion = nn.CrossEntropyLoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001, weight_decay=cfg["weight_decay"])
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=3) \
+        if cfg["use_scheduler"] else None
 
-    print("\nStarting execution training loop...")
-    for epoch in range(40):
+    history = []
+    print(f"\nStarting {EPOCHS}-epoch training loop...")
+    for epoch in range(EPOCHS):
         model.train()
         running_loss = 0.0
+        train_correct, train_total = 0, 0
         for batch_x, batch_y in train_loader:
             batch_x, batch_y = batch_x.to(device), batch_y.to(device)
             optimizer.zero_grad()
@@ -156,23 +243,47 @@ def main():
             loss.backward()
             optimizer.step()
             running_loss += loss.item()
+            _, predicted = torch.max(outputs.data, 1)
+            train_total += batch_y.size(0)
+            train_correct += (predicted == batch_y).sum().item()
 
-        # Evaluation step
+        train_loss = running_loss / len(train_loader)
+        train_acc = 100 * train_correct / train_total
+
         model.eval()
-        correct, total = 0, 0
+        val_correct, val_total, val_running_loss = 0, 0, 0.0
         with torch.no_grad():
             for batch_x, batch_y in test_loader:
                 batch_x, batch_y = batch_x.to(device), batch_y.to(device)
                 outputs = model(batch_x)
+                val_running_loss += criterion(outputs, batch_y).item()
                 _, predicted = torch.max(outputs.data, 1)
-                total += batch_y.size(0)
-                correct += (predicted == batch_y).sum().item()
+                val_total += batch_y.size(0)
+                val_correct += (predicted == batch_y).sum().item()
 
-        print(
-            f"Epoch {epoch + 1:02d}/40 | Loss: {running_loss / len(train_loader):.4f} | Speaker-Ind. Test Acc: {100 * correct / total:.2f}%")
+        val_loss = val_running_loss / len(test_loader)
+        val_acc = 100 * val_correct / val_total
 
-    torch.save(model.state_dict(), "emotion_fusion_cnn.pt")
-    print("\nWrote finalized model weights configuration out to emotion_fusion_cnn.pt")
+        print(f"Epoch {epoch + 1:02d}/{EPOCHS} | Train Loss: {train_loss:.4f} | Train Acc: {train_acc:.2f}% | "
+              f"Val Loss: {val_loss:.4f} | Val Acc: {val_acc:.2f}%")
+
+        if SAVE_HISTORY:
+            history.append(dict(epoch=epoch + 1, train_loss=train_loss, train_acc=train_acc,
+                                 val_loss=val_loss, val_acc=val_acc))
+            os.makedirs(_RESULTS_DIR, exist_ok=True)
+            tag = os.path.splitext(cfg["weights_file"])[0]
+            with open(os.path.join(_RESULTS_DIR, f"{tag}_history.csv"), "w", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=["epoch", "train_loss", "train_acc", "val_loss", "val_acc"])
+                writer.writeheader()
+                writer.writerows(history)
+
+        if scheduler is not None:
+            scheduler.step(val_acc)
+
+    os.makedirs(_MODELS_DIR, exist_ok=True)
+    weights_path = os.path.join(_MODELS_DIR, cfg["weights_file"])
+    torch.save(model.state_dict(), weights_path)
+    print(f"\nWrote finalized model weights to {weights_path}")
 
 
 if __name__ == "__main__":

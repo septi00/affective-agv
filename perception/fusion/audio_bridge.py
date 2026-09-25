@@ -218,9 +218,10 @@ class AudioBridge:
 
         BEARINGS ARE IN THE MIC ARRAY'S FRAME: 0 degrees is the ReSpeaker's
         silkscreen mark, not the camera's optical axis. Comparing these against
-        a person's position on screen needs the mounting offset between the two
-        -- that measurement is what would let audio be attributed to a specific
-        tracked person instead of to the scene."""
+        a person's position on screen needs the mounting offset between the
+        two -- see fusion/bearing.py, which does exactly that comparison, and
+        video_perception.py's `doa_tracks` parameter, which is what actually
+        attributes audio to a specific tracked person instead of to the scene."""
         with self._lock:
             if not self._tracks:
                 return []
